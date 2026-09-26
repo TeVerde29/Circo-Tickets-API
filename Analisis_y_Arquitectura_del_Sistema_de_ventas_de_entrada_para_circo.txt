@@ -1,0 +1,1059 @@
+================================================================================
+SISTEMA DE VENTA DE ENTRADAS DE CIRCO
+ANÁLISIS Y ARQUITECTURA TÉCNICA
+================================================================================
+
+FECHA: 26 de Septiembre 2026
+ROL: Analista y Arquitecto
+DIRIGIDO A: Desarrollador y Tester
+LENGUAJE: Spring Boot 3.3 + MySQL 8.0 + Docker
+METODOLOGÍA: TDD (Test-Driven Development)
+
+================================================================================
+1. INTRODUCCIÓN EJECUTIVA
+================================================================================
+
+El circo necesita un software para vender entradas online evitando que dos 
+clientes compren el mismo asiento simultáneamente.
+
+PROBLEMA CRÍTICO:
+- Sin protección: 2 usuarios cliquean "Comprar" para asiento A-15 en el mismo segundo
+- Resultado esperado: 1 lo compra, 1 recibe "Asiento no disponible"
+- Resultado actual (sin sistema): Ambos reciben confirmación (OVERBOOKING)
+
+SOLUCIÓN TÉCNICA:
+Usar Optimistic Locking de JPA (@Version) para garantizar que la actualización
+de asiento en BD es atómica a nivel de BD.
+
+================================================================================
+2. REQUISITOS FUNCIONALES
+================================================================================
+
+RF1: GESTIÓN DE FUNCIONES DE CIRCO
+- El circo puede crear múltiples funciones (distintos días/horarios)
+- Cada función tiene: nombre, fecha, capacidad total, precio
+- Estado: AVAILABLE, SOLD_OUT, CANCELLED
+
+RF2: MAPA DE ASIENTOS
+- Cada función tiene asientos individuales (ejemplo: A-1, A-2, B-1, etc)
+- Estados: AVAILABLE, RESERVED, PAID, CANCELLED
+- El usuario ve asientos disponibles antes de comprar
+
+RF3: COMPRA DE ENTRADA
+- Usuario autenticado selecciona función → selecciona asiento → confirma
+- Sistema reserva asiento en BD
+- Si otro usuario ya lo compró: respuesta 409 Conflict
+- Se genera código QR único
+
+RF4: AUDITORÍA DE COMPRAS
+- Cada intento de compra se registra (éxito o fallo)
+- Trazabilidad completa: quién, cuándo, qué asiento, resultado
+
+RF5: SEGURIDAD
+- Solo usuarios autenticados pueden comprar
+- Cada usuario solo ve sus propias boletas
+- JWT para tokens de sesión
+
+================================================================================
+3. REQUISITOS NO FUNCIONALES
+================================================================================
+
+RNF1: CONCURRENCIA
+- Mínimo 100 usuarios simultáneos intentando comprar
+- Máximo 1 usuario por asiento (garantizado por BD)
+- Latencia máxima: 500ms por compra
+
+RNF2: INTEGRIDAD DE DATOS
+- 0% de overbooking (nunca 2 boletas para 1 asiento)
+- Consistencia ACID garantizada
+
+RNF3: DISPONIBILIDAD
+- 99.5% uptime durante período de venta
+- Sin downtime para agregar nuevas funciones
+
+RNF4: ESCALABILIDAD
+- Soportar 1000 usuarios simultáneos sin degradación
+
+================================================================================
+4. ARQUITECTURA DE ALTO NIVEL
+================================================================================
+
+COMPONENTES DEL SISTEMA:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        CAPA DE PRESENTACIÓN                     │
+│  (Frontend: React/Vue/Angular - NO incluido en esta entrega)    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ REST JSON (HTTPS)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    API GATEWAY (Nginx)                          │
+│  - Rate limiting                                                │
+│  - CORS                                                         │
+│  - SSL/TLS                                                      │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ HTTP (Puerto 8080)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   SPRING BOOT APPLICATION                       │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Controllers (REST Endpoints)                           │   │
+│  │  - AuthController (login, register)                    │   │
+│  │  - TicketController (compra, consulta)                 │   │
+│  │  - SeatController (mapa de asientos)                   │   │
+│  │  - FunctionController (funciones disponibles)          │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Servicios (Lógica de Negocio)                          │   │
+│  │  - TicketService (TRANSACCIONAL - compras)             │   │
+│  │  - SeatService (consultas de asientos)                 │   │
+│  │  - UserService (autenticación)                         │   │
+│  │  - FunctionService (gestión de funciones)              │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Repositories (JPA - Acceso a BD)                       │   │
+│  │  - SeatRepository                                      │   │
+│  │  - TicketRepository                                    │   │
+│  │  - UserRepository                                      │   │
+│  │  - FunctionRepository                                  │   │
+│  │  - SeatReservationAuditRepository                       │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                           │                                     │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │  Utilidades                                             │   │
+│  │  - QRCodeGenerator                                     │   │
+│  │  - JwtUtil (generación de tokens)                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ JDBC (MySQL Connector)
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   MYSQL DATABASE (Puerto 3306)                  │
+│                                                                 │
+│  Tablas:                                                        │
+│  - users (autenticación)                                       │
+│  - functions (funciones de circo)                              │
+│  - seats (asientos con @Version)  ← CLAVE                      │
+│  - tickets (boletas vendidas)                                  │
+│  - seat_reservation_audit (log de cambios)                     │
+└─────────────────────────────────────────────────────────────────┘
+
+================================================================================
+5. CONTAINERIZACIÓN CON DOCKER
+================================================================================
+
+¿POR QUÉ DOCKERIZAR ESTE PROYECTO?
+
+Este sistema depende de dos piezas que deben funcionar juntas: la aplicación 
+Spring Boot y la base de datos MySQL. Sin Docker, cualquier persona que quiera 
+correr el proyecto (un recruiter, un compañero, tú mismo en otra PC) necesita 
+instalar Java, Maven y MySQL exactamente en las versiones correctas, crear la 
+base de datos a mano, configurar usuarios y contraseñas, etc.
+
+Con Docker, todo ese entorno queda empaquetado y se levanta con un solo 
+comando, en cualquier sistema operativo, sin instalar nada más que Docker.
+
+QUÉ SE DOCKERIZA EN ESTE PROYECTO:
+
+1. LA APLICACIÓN SPRING BOOT
+   Se empaqueta en una imagen propia que contiene el JAR ya compilado y el 
+   runtime de Java necesario para ejecutarlo. Esta imagen se construye con 
+   un Dockerfile, que es básicamente una receta de pasos: "toma esta base de 
+   Java, copia el JAR, expón el puerto 8080, ejecuta la app".
+
+2. MYSQL
+   No se dockeriza "tu" MySQL, sino que se usa la imagen oficial de MySQL 
+   que Docker descarga automáticamente. Se le indica, mediante variables de 
+   entorno, el nombre de la base de datos, usuario y contraseña que va a 
+   crear al iniciar. Esto reemplaza el proceso manual de abrir DBeaver y 
+   crear la base de datos tú mismo.
+
+3. ORQUESTACIÓN CON DOCKER COMPOSE
+   Docker Compose es el archivo que describe "quiero estos dos contenedores 
+   corriendo juntos, en esta red, con esta configuración, y que la app 
+   espere a que la base de datos esté lista antes de conectarse". Un solo 
+   comando (docker-compose up) levanta ambos servicios coordinados.
+
+CÓMO CAMBIA TU FLUJO DE TRABAJO CON DBEAVER:
+
+Esto es importante porque tú vas a seguir usando DBeaver para inspeccionar 
+la base de datos, escribir queries de verificación, revisar que los datos 
+de auditoría y las boletas se hayan guardado correctamente, etc. Docker no 
+reemplaza eso, solo cambia DÓNDE vive el MySQL al que te conectas.
+
+En vez de conectar DBeaver a un MySQL instalado directamente en tu Windows/Mac 
+(localhost:3306 con tu instalación normal), vas a conectar DBeaver a un 
+MySQL que corre DENTRO de un contenedor Docker, pero que Docker expone hacia 
+afuera en ese mismo puerto 3306. Para DBeaver, la diferencia es invisible: 
+sigue siendo "localhost:3306, usuario root, contraseña X". La única 
+diferencia real es que esa base de datos ahora se levanta y se destruye con 
+comandos de Docker en lugar de con el servicio de MySQL de tu sistema 
+operativo.
+
+Ventaja práctica: si quieres "resetear" toda la base de datos para repetir 
+un test de concurrencia desde cero, en vez de borrar tablas manualmente en 
+DBeaver, simplemente destruyes el contenedor y lo vuelves a levantar, y 
+Docker recrea la base de datos limpia automáticamente según la configuración 
+inicial.
+
+QUÉ NO CAMBIA:
+
+- Tu código Java sigue siendo el mismo, Spring Boot no sabe ni le importa 
+  si corre dentro o fuera de un contenedor.
+- Tus queries en DBeaver siguen siendo SQL normal de MySQL.
+- Tu proceso de testing con JUnit5 no cambia en absoluto.
+
+QUÉ SÍ CAMBIA (Y ES LO QUE SUMA A TU CV):
+
+- Demuestras que entiendes la diferencia entre "funciona en mi máquina" y 
+  "funciona en cualquier máquina".
+- Demuestras conocimiento de conceptos de DevOps: imágenes, contenedores, 
+  redes internas entre servicios, variables de entorno, volúmenes para 
+  persistencia de datos.
+- El repositorio se vuelve ejecutable por cualquier recruiter o compañero 
+  con un solo comando, sin explicaciones adicionales.
+
+ELEMENTOS QUE DEBES PREPARAR (COMO DESARROLLADOR):
+
+1. Un Dockerfile para la aplicación Spring Boot (define cómo se construye 
+   la imagen de tu app).
+2. Un archivo docker-compose.yml que describa los dos servicios (app y 
+   mysql), sus variables de entorno, puertos expuestos, y la dependencia 
+   entre ellos (la app debe esperar a que MySQL esté listo).
+3. Un volumen de Docker para que los datos de MySQL persistan entre 
+   reinicios del contenedor (si no, cada vez que reinicias pierdes todo).
+4. Opcionalmente, un archivo de inicialización SQL que Docker ejecute 
+   automáticamente la primera vez que crea el contenedor de MySQL, para 
+   que las tablas ya existan sin que tengas que crearlas a mano.
+
+CÓMO LO PROBARÍAS COMO TESTER:
+
+- Levantar el entorno completo con Docker y verificar que la app conecta 
+  correctamente a MySQL sin configuración manual.
+- Apagar y volver a levantar los contenedores, verificando que los datos 
+  persisten (gracias al volumen) o se resetean (si eliminas el volumen 
+  intencionalmente).
+- Conectar DBeaver al MySQL dockerizado y confirmar que ves las mismas 
+  tablas, con los mismos datos, que verías en una instalación normal.
+- Ejecutar el test de concurrencia de 100 threads contra la instancia 
+  dockerizada y confirmar que el comportamiento es idéntico al de MySQL 
+  corriendo sin Docker.
+
+================================================================================
+6. FLUJO DE COMPRA (CON MANEJO DE CONCURRENCIA)
+================================================================================
+
+ESCENARIO: Usuario A y Usuario B intentan comprar asiento A-15 simultáneamente
+
+TIEMPO 0ms:
+┌──────────────────────────────────────────┐
+│ USUARIO A                 │ USUARIO B      │
+│ POST /tickets/buy         │ POST /tickets/buy
+│ { seatCode: "A-15",      │ { seatCode: "A-15",
+│   functionId: 1 }        │   functionId: 1 }
+└──────────────────────────────────────────┘
+                  ▼
+         ┌────────────────────────┐
+         │ Spring recibe 2 requests│
+         └────────┬───────────────┘
+                  ▼
+    ┌─────────────────────────────────┐
+    │ Ambos: verifican autenticación  │
+    │ (JWT token válido)              │
+    └─────────────────────────────────┘
+                  ▼
+    ┌─────────────────────────────────────────────────┐
+    │ TicketService.buySeat() × 2 (en paralelo)      │
+    │ @Transactional(isolation=READ_COMMITTED)       │
+    └────────────┬────────────────────────────────────┘
+                 ▼
+        USUARIO A                          USUARIO B
+        │                                  │
+        ▼                                  ▼
+   SELECT * FROM seats            SELECT * FROM seats
+   WHERE seatCode='A-15'          WHERE seatCode='A-15'
+   RESULT: status=AVAILABLE,      RESULT: status=AVAILABLE,
+           version=0                      version=0
+   │                              │
+   ▼                              ▼
+Validar en memoria:            Validar en memoria:
+¿Disponible? SÍ                ¿Disponible? SÍ
+   │                              │
+   ▼                              ▼
+UPDATE seats                   UPDATE seats
+SET status='RESERVED',         SET status='RESERVED',
+    version=1                      version=1
+WHERE seatCode='A-15'          WHERE seatCode='A-15'
+  AND version=0  ← CLAVE         AND version=0  ← CLAVE
+   │                              │
+   ▼ (101ms)                      ▼ (102ms)
+✅ 1 fila afectada             ❌ 0 filas afectadas
+                               (version ya es 1)
+   │                              │
+   ▼                              ▼
+OptimisticLockingException NO   OptimisticLockingException SÍ
+   │                              │
+   ▼                              ▼
+Crear boleta en BD            Capturar excepción
+Guardar auditoría             Lanzar SeatNotAvailableException
+Retornar 201 Created          │
+✅ ÉXITO                       ▼
+                            Retornar 409 Conflict
+                            ❌ FALLO
+
+RESULTADO FINAL:
+- BD: 1 ticket, asiento status=RESERVED, version=1
+- Usuario A: Boleta + QR code
+- Usuario B: Mensaje "Asiento comprado, intenta otro"
+
+================================================================================
+7. DIAGRAMA DE FLUJO DETALLADO
+================================================================================
+
+FLUJO DE REGISTRO:
+
+[Usuario] → POST /auth/register
+              {email, password, fullName, phone}
+                    │
+                    ▼
+            [AuthController]
+                    │
+                    ▼
+            [UserService.register()]
+                    │
+         ┌──────────┴──────────┐
+         │                     │
+         ▼                     ▼
+   Email único?            Hash password
+   (Query BD)              (BCrypt)
+         │                     │
+         ├─ NO                 │
+         │  └─► UserAlreadyExistsException
+         │
+         ├─ SÍ
+         │  └─► CREATE User en BD
+         │      │
+         │      ▼
+         │  [UserRepository.save()]
+         │      │
+         │      ▼
+         │  Usuario guardado (id=123)
+         │      │
+         └──────┬─────────────────────────┐
+                │                         │
+                ▼                         ▼
+            [JwtUtil.generateToken()]  Retornar 201
+            (userId + email)           {token, userId, email}
+                │
+                ▼
+            Guardar en cliente
+            (localStorage o sessionStorage)
+
+---
+
+FLUJO DE COMPRA:
+
+[Usuario] → POST /tickets/buy
+              {seatCode, functionId}
+                    │
+                    ▼
+            [TicketController]
+                    │
+                    ├─ Validar JWT ✓
+                    │  (obtener userId)
+                    │
+                    ▼
+            [TicketService.buySeat()]
+            @Transactional(isolation=READ_COMMITTED)
+                    │
+         ┌──────────┼──────────┐
+         │          │          │
+         ▼          ▼          ▼
+   Validar   Obtener    Obtener
+   Usuario   Función    Asiento
+   (findById)(findById) (findBySeatCode)
+         │          │          │
+         ├─ NO      │          │
+         │  └─► UserNotFoundException
+         │
+         ├─ SÍ
+         │  └──────┬──────────┐
+         │         │          │
+         │         ▼          ▼
+         │      ¿Existe?   ¿Existe?
+         │      NO ─────► FunctionNotFoundException
+         │      SÍ   NO ─► SeatNotFoundException
+         │      │    SÍ
+         │      ▼         │
+         │  ¿Cancelada?   │
+         │  SÍ ────────► FunctionCancelledException
+         │  │            
+         │  NO           
+         │  │            ▼
+         │  └────────► Validar status
+         │             (debe ser AVAILABLE)
+         │                  │
+         │              ├─ NO
+         │              │  └─► SeatNotAvailableException
+         │              │
+         │              ├─ SÍ
+         │              │
+         │              ▼
+         │         [ACTUALIZAR SEAT]
+         │         seat.setStatus=RESERVED
+         │         seatRepository.save(seat)
+         │              │
+         │              ├─ OptimisticLockingException
+         │              │  └─► SeatNotAvailableException
+         │              │      (otro usuario ganó)
+         │              │
+         │              ├─ No exception
+         │              │
+         │              ▼
+         │         Generar QR code
+         │         Crear Ticket en BD
+         │              │
+         │              ▼
+         │         Registrar en auditoría
+         │              │
+         │              ▼
+         │         Retornar 201 Created
+         │         {ticketCode, qrCode, ...}
+         │
+         └─► GlobalExceptionHandler captura excepciones
+             y retorna respuesta apropiada (409, 404, etc)
+
+================================================================================
+8. MODELO DE DATOS
+================================================================================
+
+TABLA: users
+├─ id (PK, AUTO_INCREMENT)
+├─ email (UNIQUE, NOT NULL)
+├─ password (hashed, NOT NULL)
+├─ fullName (NOT NULL)
+├─ phone
+├─ createdAt (timestamp, NOT NULL)
+└─ updatedAt (timestamp)
+
+TABLA: functions
+├─ id (PK, AUTO_INCREMENT)
+├─ name (NOT NULL)
+├─ description
+├─ functionDate (DATETIME, NOT NULL)
+├─ totalSeats (NOT NULL)
+├─ availableSeats (NOT NULL, se actualiza)
+├─ price (DECIMAL 10,2)
+├─ status (ENUM: AVAILABLE, SOLD_OUT, CANCELLED)
+├─ createdAt (timestamp)
+└─ updatedAt (timestamp)
+
+TABLA: seats ← CRÍTICA PARA CONCURRENCIA
+├─ id (PK, AUTO_INCREMENT)
+├─ seatCode (NOT NULL, ej: "A-15")
+├─ function_id (FK → functions)
+├─ rowNumber (ej: "A", "B")
+├─ seatNumber (ej: 1, 2, 3)
+├─ status (ENUM: AVAILABLE, RESERVED, PAID, CANCELLED)
+├─ version (INT, DEFAULT 0) ← LA MAGIA (@Version)
+├─ createdAt
+└─ updatedAt
+
+RELACIÓN: function_id + seatCode = UNIQUE
+(No se puede tener dos asientos A-15 en la misma función)
+
+---
+
+TABLA: tickets
+├─ id (PK, AUTO_INCREMENT)
+├─ ticketCode (UNIQUE)
+├─ user_id (FK → users)
+├─ seat_id (FK → seats)
+├─ function_id (FK → functions)
+├─ qrCode (LONGTEXT)
+├─ price (DECIMAL 10,2)
+├─ status (ENUM: ACTIVE, USED, REFUNDED, CANCELLED)
+├─ boughtAt (TIMESTAMP)
+└─ usedAt (nullable, cuando se validó en entrada)
+
+---
+
+TABLA: seat_reservation_audit
+├─ id (PK)
+├─ seat_id (FK → seats)
+├─ user_id (FK → users)
+├─ action (ej: RESERVED, FAILED_OPTIMISTIC_LOCK)
+├─ oldStatus (ENUM value anterior)
+├─ newStatus (ENUM value nuevo)
+├─ oldVersion (INT anterior)
+├─ newVersion (INT nuevo)
+└─ timestamp (auditoría temporal)
+
+USO: Debugging de concurrencia, análisis de intentos fallidos
+
+================================================================================
+9. MECANISMO DE OPTIMISTIC LOCKING (LA SOLUCIÓN)
+================================================================================
+
+¿QUÉ ES OPTIMISTIC LOCKING?
+
+Es una estrategia de concurrencia que asume que las colisiones son raras.
+En lugar de LOCKEAR la fila (PESSIMISTIC), verificamos si fue modificada.
+
+IMPLEMENTACIÓN EN SPRING JPA:
+
+1. Entidad:
+   @Entity
+   public class Seat {
+       @Version
+       private Integer version;  // Spring maneja esto automáticamente
+       ...
+   }
+
+2. Spring genera SQL:
+   UPDATE seats 
+   SET status='RESERVED', version=version+1 
+   WHERE id=123 AND version=0
+   
+   (Si version no es 0 → 0 filas afectadas)
+
+3. Si 0 filas:
+   Spring lanza: JpaOptimisticLockingFailureException
+
+4. Capturamos excepción:
+   @Service
+   public class TicketService {
+       @Transactional
+       public void buySeat(...) {
+           try {
+               seat.setStatus(RESERVED);
+               seatRepository.save(seat);  // Aquí puede fallar
+           } catch (JpaOptimisticLockingFailureException e) {
+               throw new SeatNotAvailableException("Otro usuario ganó");
+           }
+       }
+   }
+
+VENTAJAS:
+✓ No bloquea recursos (DB locks)
+✓ Mejor performance bajo alta concurrencia
+✓ Detecta cambios entre lectura y escritura
+✓ Es estándar en e-commerce
+
+DESVENTAJAS:
+✗ Si hay muchas colisiones, el cliente debe reintentar
+✗ No garantiza orden de ejecución (first-come != first-served)
+
+PARA NUESTRO CASO: PERFECTO
+- Compradores son usuarios humanos (no máquinas)
+- Si fallan, pueden elegir otro asiento
+- No requiere retry automático
+
+================================================================================
+10. FLUJO DE TESTING (CONCURRENCIA)
+================================================================================
+
+TEST: 100 usuarios, 10 asientos
+
+SETUP:
+1. Limpiar BD (eliminar datos previos)
+2. Crear 1 función: "Función Test"
+3. Crear 10 asientos: A-1, A-2, ..., A-10 (status=AVAILABLE, version=0)
+4. Crear 100 usuarios: user1@test.com, user2@test.com, ..., user100@test.com
+
+EJECUCIÓN:
+1. Crear ExecutorService con 100 threads
+2. Lanzar 100 solicitudes simultáneamente:
+   for i=1 to 100:
+      thread[i] → POST /tickets/buy {seatCode: "A-" + ((i % 10) + 1), ...}
+   
+   Esto hace que todos luchen por los mismos 10 asientos
+
+3. Esperar a que todos terminen (CountDownLatch)
+
+4. Registrar:
+   - Cuántos ganaron (successCount)
+   - Cuántos perdieron (failureCount)
+   - Quién compró qué asiento
+   - Mensajes de error
+
+ASSERTIONS:
+✓ successCount == 10 (exactamente 10 ganadores)
+✓ failureCount == 90 (exactamente 90 perdedores)
+✓ DB tickets.size == 10 (10 boletas)
+✓ DB seats.status=RESERVED.size == 10 (10 asientos reservados)
+✓ Para cada asiento: version == 1 (fue modificado)
+✓ No hay dos tickets para el mismo asiento (UNIQUE seat_id)
+
+SALIDA ESPERADA:
+```
+✅ Usuario 5 compró A-3
+✅ Usuario 12 compró A-1
+✅ Usuario 27 compró A-5
+...
+❌ Usuario 18 falló: Asiento A-1 fue comprado por otro usuario
+❌ Usuario 32 falló: Asiento A-3 fue comprado por otro usuario
+...
+
+=== RESULTADOS ===
+Éxitos: 10
+Fallos: 90
+TEST PASÓ ✓
+```
+
+================================================================================
+11. CASOS DE USO IMPLEMENTADOS
+================================================================================
+
+CU-01: REGISTRARSE
+Precondiciones: Usuario no existe en BD
+Flujo:
+  1. POST /auth/register {email, password, fullName, phone}
+  2. Validar email único
+  3. Hashear password con BCrypt
+  4. Guardar usuario en BD
+  5. Retornar 201 {token, userId}
+Postcondiciones: Usuario creado en BD, token listo para usar
+
+---
+
+CU-02: INICIAR SESIÓN
+Precondiciones: Usuario existe
+Flujo:
+  1. POST /auth/login {email, password}
+  2. Buscar usuario por email
+  3. Validar password (BCrypt.matches)
+  4. Generar JWT token
+  5. Retornar 200 {token, userId}
+Postcondiciones: Cliente tiene token válido
+
+---
+
+CU-03: VER FUNCIONES DISPONIBLES
+Precondiciones: Existen funciones en BD
+Flujo:
+  1. GET /api/functions
+  2. Buscar todas las funciones con status=AVAILABLE
+  3. Retornar 200 [function1, function2, ...]
+Postcondiciones: Usuario ve cartelera
+
+---
+
+CU-04: VER ASIENTOS DE UNA FUNCIÓN
+Precondiciones: Función existe, usuario autenticado
+Flujo:
+  1. GET /api/seats/function/1 (con JWT)
+  2. Validar JWT
+  3. Buscar asientos con status=AVAILABLE para función 1
+  4. Retornar 200 [seat1, seat2, ...]
+Postcondiciones: Usuario ve mapa de asientos disponibles
+
+---
+
+CU-05: COMPRAR ENTRADA ★★★ CRITICAL
+Precondiciones: 
+  - Usuario autenticado
+  - Función existe y no está cancelada
+  - Asiento existe y está disponible
+Flujo:
+  1. POST /api/tickets/buy {seatCode, functionId} (con JWT)
+  2. Extraer userId del JWT
+  3. Validar usuario, función, asiento
+  4. Iniciar transacción (@Transactional)
+  5. SELECT seat WHERE seatCode=X AND function_id=Y
+     (En memoria: seat.version=0, status=AVAILABLE)
+  6. Validar status==AVAILABLE
+  7. Cambiar status a RESERVED
+  8. UPDATE seat SET status='RESERVED', version=1 
+     WHERE id=123 AND version=0
+     ├─ Si 1 fila: Éxito
+     └─ Si 0 filas: OptimisticLockingException
+  9. Si falla: Capturar, registrar auditoría, retornar 409
+  10. Si éxito:
+      - Generar código QR
+      - Crear Ticket en BD
+      - Registrar en auditoría (RESERVED)
+      - Retornar 201 {ticketCode, qrCode, ...}
+Postcondiciones: 
+  ✓ Boleta creada
+  ✓ Asiento reservado
+  ✓ Usuario recibe QR
+  ✗ Otro usuario recibe error
+
+---
+
+CU-06: VER MIS BOLETAS
+Precondiciones: Usuario autenticado, tiene boletas
+Flujo:
+  1. GET /api/tickets/user/123 (userId en JWT)
+  2. SELECT tickets WHERE user_id=123
+  3. Retornar 200 [ticket1, ticket2, ...]
+Postcondiciones: Usuario ve historial de compras
+
+---
+
+CU-07: VALIDAR ENTRADA EN PUERTA (Admin)
+Precondiciones: Usuario admin, boleta existe
+Flujo:
+  1. Scanner QR → extrae ticketCode
+  2. GET /api/tickets/{ticketCode}
+  3. Validar ticket.status==ACTIVE
+  4. UPDATE ticket SET status='USED', usedAt=NOW()
+  5. Permitir entrada
+Postcondiciones: Boleta marcada como usada
+
+================================================================================
+12. MATRIZ DE DECISIONES ARQUITECTÓNICAS
+================================================================================
+
+DECISIÓN 1: Optimistic Locking vs Pessimistic Locking
+┌──────────────────────┬──────────────┬──────────────────┐
+│ Aspecto              │ Optimistic   │ Pessimistic      │
+├──────────────────────┼──────────────┼──────────────────┤
+│ Bloqueo en BD        │ No           │ Sí (SELECT...FOR │
+│                      │              │ UPDATE)          │
+│ Performance alto     │ ✓            │ ✗                │
+│ Colisiones raras     │ ✓            │ ✓                │
+│ Colisiones frecuentes│ ✗            │ ✓                │
+│ Implementación       │ @Version     │ @Lock            │
+│ Caso de uso actual   │ PERFECTO     │ Overkill         │
+└──────────────────────┴──────────────┴──────────────────┘
+ELEGIDO: Optimistic Locking (@Version)
+RAZÓN: Venta de entradas es read-heavy, pocas colisiones reales
+
+---
+
+DECISIÓN 2: Spring Boot vs Node.js
+┌──────────────────────┬──────────────┬──────────────────┐
+│ Aspecto              │ Spring Boot  │ Node.js          │
+├──────────────────────┼──────────────┼──────────────────┤
+│ Transacciones ACID   │ ✓            │ Manual           │
+│ ORM maduro           │ ✓ JPA        │ ✓ Prisma/Sequelize
+│ Concurrencia         │ ✓ Native     │ ✓ async/await    │
+│ Testing              │ ✓ JUnit5     │ ✓ Jest           │
+│ Escalabilidad        │ ✓            │ ✓                │
+│ Complejidad (este)   │ SIMPLE       │ MÁS COMPLEJO     │
+│ Requisito UNU        │ Enseña Java  │ No relevante     │
+└──────────────────────┴──────────────┴──────────────────┘
+ELEGIDO: Spring Boot
+RAZÓN: Mejor para ACID, transacciones, mejor en UNU
+
+---
+
+DECISIÓN 3: MySQL vs PostgreSQL
+┌──────────────────────┬──────────────┬──────────────────┐
+│ Aspecto              │ MySQL 8.0    │ PostgreSQL       │
+├──────────────────────┼──────────────┼──────────────────┤
+│ Disponibilidad       │ ✓ Disponible │ ✓ Disponible     │
+│ Concurrencia         │ ✓            │ ✓                │
+│ Optimistic Locking   │ ✓            │ ✓                │
+│ Documentación        │ ✓ Abundante  │ ✓ Abundante      │
+│ Hosting              │ ✓ Barato     │ ✓ Barato         │
+│ Elección             │ SIMPLE       │ Más robusto      │
+└──────────────────────┴──────────────┴──────────────────┘
+ELEGIDO: MySQL 8.0
+RAZÓN: Simplicidad, famoso, buen soporte
+
+---
+
+DECISIÓN 4: JWT vs Session Cookies
+┌──────────────────────┬──────────────┬──────────────────┐
+│ Aspecto              │ JWT          │ Session Cookies  │
+├──────────────────────┼──────────────┼──────────────────┤
+│ Stateless            │ ✓            │ ✗ (estado en BD) │
+│ Escalabilidad        │ ✓            │ ✗ (sticky sessions)
+│ Revocación           │ ✗ Difícil    │ ✓ Inmediata      │
+│ CORS                 │ ✓ Fácil      │ ✗ Complicado     │
+│ Mobile/SPA           │ ✓            │ ✗                │
+└──────────────────────┴──────────────┴──────────────────┘
+ELEGIDO: JWT
+RAZÓN: Stateless, escalable, perfecta para REST API
+
+---
+
+DECISIÓN 5: Ejecución con Docker vs Instalación Local
+┌──────────────────────┬──────────────┬──────────────────┐
+│ Aspecto              │ Docker       │ Instalación Local│
+├──────────────────────┼──────────────┼──────────────────┤
+│ Portabilidad         │ ✓ Total      │ ✗ Depende del SO │
+│ Setup para terceros  │ ✓ 1 comando  │ ✗ Manual, lento  │
+│ Consistencia entornos│ ✓ Idéntico   │ ✗ "Funciona en   │
+│                      │              │   mi máquina"    │
+│ Uso con DBeaver      │ ✓ Igual      │ ✓ Igual          │
+│ Curva de aprendizaje │ Media        │ Baja             │
+│ Reseteo de datos     │ ✓ Instantáneo│ ✗ Manual (DROP)  │
+└──────────────────────┴──────────────┴──────────────────┘
+ELEGIDO: Docker (MySQL corriendo en contenedor, accesible desde DBeaver)
+RAZÓN: El desarrollo y testing siguen siendo iguales (mismo DBeaver, mismo 
+       MySQL, mismo puerto 3306), pero el proyecto queda reproducible para 
+       cualquier persona que lo revise, y el reseteo del entorno para 
+       repetir pruebas de concurrencia es inmediato.
+
+================================================================================
+13. ATRIBUTOS DE CALIDAD
+================================================================================
+
+DISPONIBILIDAD:
+- Target: 99.5% uptime
+- Implementación: Health checks, graceful shutdown
+- Monitoreo: Logs, métricas, alertas
+
+SEGURIDAD:
+- Autenticación: JWT + BCrypt
+- Autorización: Spring Security
+- Validación: Input validation en DTOs
+- Transporte: HTTPS/TLS
+
+INTEGRIDAD:
+- Atomicidad: @Transactional + Optimistic Locking
+- Consistencia: Validaciones en service layer
+- Aislamiento: Isolation.READ_COMMITTED
+- Durabilidad: MySQL ACID
+
+PERFORMANCE:
+- Latencia: <500ms por compra (SLA)
+- Throughput: 100+ usuarios/minuto
+- Conexiones: Connection pooling (HikariCP)
+
+ESCALABILIDAD:
+- Horizontal: Stateless app (múltiples instancias)
+- Vertical: Tuning de BD (indexes, queries)
+- Caching: Redis (opcional para futuro)
+
+MANTENIBILIDAD:
+- Código: Clean Code, SOLID
+- Tests: JUnit5, Mockito, integración
+- Documentación: Javadoc, README
+- CI/CD: GitHub Actions (opcional)
+
+================================================================================
+14. RIESGOS IDENTIFICADOS
+================================================================================
+
+RIESGO 1: Race Condition en Compra
+Probabilidad: ALTA (usuarios concurrentes)
+Impacto: CRÍTICO (overbooking)
+Mitigación: Optimistic Locking (@Version)
+Validación: Test con 100 threads
+
+---
+
+RIESGO 2: Pérdida de Auditoría
+Probabilidad: MEDIA (error durante INSERT)
+Impacto: MEDIA (debugging difícil)
+Mitigación: Try-catch al guardar auditoría, separate transaction
+Validación: Test con fallo intencional
+
+---
+
+RIESGO 3: Token JWT Expirado
+Probabilidad: MEDIA (usuario espera mucho)
+Impacto: BAJA (usuario renueva token)
+Mitigación: Expiration=24horas, refresh token (futuro)
+Validación: Test de token inválido
+
+---
+
+RIESGO 4: Función Cancelada Mientras Compra
+Probabilidad: BAJA (admin raramente cancela)
+Impacto: MEDIA (usuario confundido)
+Mitigación: Validar function.status antes de compra
+Validación: Test CU-05 con función cancelada
+
+---
+
+RIESGO 5: Base de Datos Inaccesible
+Probabilidad: BAJA (hosting confiable)
+Impacto: CRÍTICO (sistema down)
+Mitigación: Connection pooling, retry logic, health checks
+Validación: Monitoreo en producción
+
+================================================================================
+15. CRONOGRAMA DE DESARROLLO (ESTIMADO)
+================================================================================
+
+FASE 1: SETUP (1 semana)
+├─ Crear proyecto Maven con Spring Initializr
+├─ Configurar application.properties
+├─ Crear BD y tablas en MySQL
+├─ Agregar dependencias en pom.xml
+└─ Verificar startup básico
+
+FASE 2: ENTIDADES (3 días)
+├─ Entity User
+├─ Entity Function
+├─ Entity Seat (con @Version)
+├─ Entity Ticket
+└─ Entity SeatReservationAudit
+
+FASE 3: REPOSITORIOS (3 días)
+├─ SeatRepository
+├─ TicketRepository
+├─ UserRepository
+├─ FunctionRepository
+└─ SeatReservationAuditRepository
+
+FASE 4: SERVICIOS (1 semana)
+├─ TicketService (compra, con @Transactional)
+├─ SeatService (consultas)
+├─ UserService (autenticación)
+├─ FunctionService (gestión)
+└─ Agregar excepciones personalizadas
+
+FASE 5: SEGURIDAD (4 días)
+├─ SecurityConfig
+├─ JwtUtil (generación/validación)
+├─ AuthService
+├─ JwtAuthenticationFilter
+└─ BCrypt password encoder
+
+FASE 6: CONTROLADORES (1 semana)
+├─ AuthController (register, login)
+├─ TicketController (compra, consultas)
+├─ SeatController (mapa asientos)
+├─ FunctionController (funciones)
+└─ GlobalExceptionHandler
+
+FASE 7: UTILIDADES (3 días)
+├─ QRCodeGenerator
+├─ JwtUtil (completar)
+└─ Helpers
+
+FASE 8: TESTS (1 semana)
+├─ Test de concurrencia (100 threads)
+├─ Test de validaciones
+├─ Test de excepciones
+├─ Test de seguridad
+└─ Cobertura >70%
+
+FASE 9: INTEGRACIÓN Y DEPLOYMENT (4 días)
+├─ Dockerfile
+├─ Docker-compose
+├─ Health checks
+├─ Documentación README
+└─ Deploy en ambiente test
+
+FASE 10: QA Y AJUSTES (1 semana)
+├─ Pruebas manuales con Postman
+├─ Pruebas de carga (JMeter)
+├─ Ajustes de performance
+├─ Fixes de bugs menores
+└─ Release v1.0.0
+
+TOTAL: ~8 semanas
+
+================================================================================
+16. ESTRATEGIA DE TESTING
+================================================================================
+
+UNIT TESTING:
+- Servicios (mocks de repositories)
+- Utilidades (QRCodeGenerator, JwtUtil)
+- Cobertura: >80%
+
+INTEGRACIÓN:
+- Controllers + Services + Repositories
+- BD en memoria (H2) para tests
+- Cobertura: >70%
+
+CONCURRENCIA:
+- 100 threads simultáneos
+- 10 asientos, múltiples intentos
+- Assertions: éxitos, fallos, integridad BD
+
+SEGURIDAD:
+- JWT válido vs inválido
+- Contraseñas hasheadas
+- Endpoints protegidos
+
+VALIDACIÓN:
+- DTOs con validaciones
+- Input validation (email, phone)
+- Boundary cases
+
+================================================================================
+17. MÉTRICAS DE ÉXITO
+================================================================================
+
+M1: Cero Overbooking
+- Métrica: Tickets > Asientos Disponibles = 0
+- Target: 0 (SIEMPRE)
+- Validación: Auditoría + conteos en BD
+
+M2: Latencia de Compra
+- Métrica: p95 response time < 500ms
+- Target: 500ms
+- Herramienta: New Relic, DataDog
+
+M3: Disponibilidad
+- Métrica: (Uptime / Tiempo Total) * 100
+- Target: 99.5%
+- Herramienta: Health checks
+
+M4: Satisfacción de Usuario
+- Métrica: Tasa de error al comprar < 5%
+- Target: 5%
+- Validación: Logs + surveys
+
+M5: Cobertura de Tests
+- Métrica: Code coverage %
+- Target: >80%
+- Herramienta: JaCoCo
+
+================================================================================
+18. PRÓXIMOS PASOS
+================================================================================
+
+INMEDIATO (Después de v1.0):
+1. Agregar refresh tokens (seguridad mejorada)
+2. Agregar reembolsos de boletas
+3. Agregar códigos de promoción/cupones
+4. Agregar descuentos por cantidad
+
+CORTO PLAZO (Mes 2):
+1. Frontend React/Vue
+2. Integración de pagos (Stripe, PayPal)
+3. Notificaciones por email
+4. Admin dashboard
+
+MEDIANO PLAZO (Mes 3-4):
+1. Sistema de canciones/shows
+2. Reseñas de funciones
+3. Wishlist de asientos
+4. Analytics avanzado
+
+LARGO PLAZO (Mes 5+):
+1. App móvil (React Native)
+2. Sistema de fidelización
+3. Venta de merchandise
+4. Streaming de funciones
+
+================================================================================
+FIN DE DOCUMENTACIÓN
+================================================================================
+
+Esta documentación te proporciona:
+
+1. ¿QUÉ? - Qué construir (funcionalidades, flujos)
+2. ¿CÓMO? - Cómo implementarlo (arquitectura, patrones)
+3. ¿POR QUÉ? - Por qué estas decisiones (justificación)
+4. ¿PRUEBAS? - Cómo validar que funciona (testing)
+
+Como desarrollador, ahora tienes:
+- Diagrama claro del sistema
+- Flujos detallados
+- Modelo de datos completo
+- Estrategia de testing
+- Cronograma realista
+
+Como tester, tienes:
+- Casos de uso a validar
+- Escenarios de concurrencia
+- Métricas de éxito
+- Matriz de riesgos
+- Estrategia QA
+
+¡Adelante con la implementación!
